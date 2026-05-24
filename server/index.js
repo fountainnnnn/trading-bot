@@ -13,6 +13,22 @@ app.use(express.json());
 
 initDb();
 
+// ─── Crash Resilience: catch everything ───
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[fatal] Unhandled Rejection at:', promise, 'reason:', reason?.message || reason);
+});
+process.on('uncaughtException', (err, origin) => {
+  console.error('[fatal] Uncaught Exception:', err?.message || err, 'at:', origin);
+});
+
+// Periodic SQLite WAL checkpoint to prevent WAL file bloat
+setInterval(() => {
+  try {
+    const db = getDb();
+    db.pragma('wal_checkpoint(RESTART)');
+  } catch (e) { /* silent */ }
+}, 3600000); // every hour
+
 // ─── Portfolio (with live prices for P&L) ───
 app.get('/api/portfolio', async (req, res) => {
   try {
@@ -552,25 +568,31 @@ app.get('/api/review', (req, res) => {
     }
 
     // ─── Calculate & APPLY parameter adjustments ────────────────────────────────
-    let params = { stopMultiplier: 1.5, rsiOversold: 30, rsiOverbought: 70, minRewardRisk: 1.5, maxRiskPercent: 2.0 };
+    // Key insight: when losing, WIDEN stops and REDUCE risk
+    // Tightening stops in a losing streak causes more stop-outs (death spiral)
+    let params = { stopMultiplier: 2.0, rsiOversold: 25, rsiOverbought: 75, minRewardRisk: 2.0, maxRiskPercent: 1.5 };
     const adjustments = [];
 
     if (totalTrades >= 5) {
       if (winRate < 0.4) {
-        params.rsiOversold = 25; params.rsiOverbought = 75;
-        params.stopMultiplier = 2.0;
-        adjustments.push('Win rate ' + (winRate*100).toFixed(0) + '% — tightened RSI to 25/75, stop to 2.0x');
+        // Losing: widen stops, extreme RSI only, lower risk
+        params.rsiOversold = 20; params.rsiOverbought = 80;
+        params.stopMultiplier = 2.5;
+        params.minRewardRisk = 2.5;
+        params.maxRiskPercent = 1.0;
+        adjustments.push('Win rate ' + (winRate*100).toFixed(0) + '% — selective: RSI 20/80, stop 2.5x, risk 1%');
       } else if (winRate > 0.6) {
-        params.rsiOversold = 35; params.rsiOverbought = 65;
-        params.stopMultiplier = 1.2;
-        adjustments.push('Win rate ' + (winRate*100).toFixed(0) + '% — loosened RSI to 35/65, stop to 1.2x');
+        params.rsiOversold = 30; params.rsiOverbought = 70;
+        params.stopMultiplier = 2.0;
+        params.minRewardRisk = 2.0;
+        params.maxRiskPercent = 1.5;
+        adjustments.push('Win rate ' + (winRate*100).toFixed(0) + '% — normal mode');
       }
-      if (avgLoss > 0 && avgWin > 0 && avgLoss > avgWin * 2) {
-        params.stopMultiplier = 1.0;
-        adjustments.push('Losses ' + (avgLoss/avgWin).toFixed(1) + 'x bigger than wins — forced stop to 1.0x');
+      if (avgLoss > 0 && avgWin > 0 && avgLoss > avgWin * 1.5) {
+        params.stopMultiplier = Math.max(params.stopMultiplier, 2.5);
+        params.minRewardRisk = Math.max(params.minRewardRisk, 2.5);
+        adjustments.push('Losses ' + (avgLoss/avgWin).toFixed(1) + 'x bigger than wins — widened stops');
       }
-      params.minRewardRisk = winRate < 0.4 ? 2.0 : 1.5;
-      params.maxRiskPercent = winRate < 0.4 ? 1.5 : 2.0;
     }
 
     // Write adjusted params to database

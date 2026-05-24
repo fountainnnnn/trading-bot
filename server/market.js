@@ -42,6 +42,18 @@ const WATCHLIST = [
 const cache = new Map();
 const CACHE_TTL_QUOTE = 60000;   // 1 min
 const CACHE_TTL_HIST = 300000;   // 5 min
+const CACHE_MAX_ENTRIES = 200;   // prevent memory leak
+
+// Evict stale entries when cache grows too large
+function evictCache() {
+  if (cache.size < CACHE_MAX_ENTRIES) return;
+  const now = Date.now();
+  const oldest = [...cache.entries()]
+    .filter(([, v]) => now - v.ts > CACHE_TTL_HIST)
+    .map(([k]) => k);
+  for (const k of oldest) cache.delete(k);
+}
+setInterval(evictCache, 600000); // every 10 min
 
 // ─── Source detection (isCrypto now exported below) ──────────
 

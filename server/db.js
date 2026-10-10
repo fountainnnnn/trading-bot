@@ -70,6 +70,35 @@ export function initDb() {
   try { db.exec('ALTER TABLE metrics ADD COLUMN trading_paused INTEGER DEFAULT 0'); } catch (e) {}
   try { db.exec('ALTER TABLE metrics ADD COLUMN last_trade_at TEXT DEFAULT NULL'); } catch (e) {}
   try { db.exec('ALTER TABLE trades ADD COLUMN slippage REAL DEFAULT NULL'); } catch (e) {}
+  // Columns the strategy and review code read/write but the base schema lacked.
+  try { db.exec('ALTER TABLE trades ADD COLUMN pnl REAL DEFAULT NULL'); } catch (e) {}
+  try { db.exec('ALTER TABLE metrics ADD COLUMN params TEXT DEFAULT NULL'); } catch (e) {}
+  // Idempotency key for /api/execute: one trade per request_id.
+  try { db.exec('ALTER TABLE trades ADD COLUMN request_id TEXT DEFAULT NULL'); } catch (e) {}
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_request_id ON trades(request_id) WHERE request_id IS NOT NULL');
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS journal (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      trade_id TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      verdict_reason TEXT,
+      signal_quality REAL,
+      confidence REAL,
+      planned_entry REAL,
+      planned_stop REAL,
+      planned_target REAL,
+      planned_shares REAL,
+      risk_amount REAL,
+      position_size_pct REAL,
+      news_risk TEXT,
+      market_data_ref TEXT,
+      compliance_passed INTEGER DEFAULT 1,
+      violation TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
 
   return db;
 }

@@ -1,8 +1,10 @@
 import express from 'express';
 import cors from 'cors';
 import { initDb, getDb } from './db.js';
-import { getQuote, getWatchlist, getTrainingData, isMarketOpen, isPreMarket, isCrypto } from './market.js';
+import { fileURLToPath } from 'url';
+import { getQuote, getHistorical, getWatchlist, getTrainingData, isMarketOpen, isPreMarket, isCrypto } from './market.js';
 import { analyzeSymbol, executeTrade, executeAIDecision, evaluateDay } from './strategy.js';
+import { createExclusiveRunner } from './exclusive.js';
 
 const PORT = parseInt(process.env.PORT || '5900', 10);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -12,6 +14,9 @@ app.use(cors({ origin: false }));
 app.use(express.json());
 
 initDb();
+
+// Scans (timer and manual) share one lock so they never run concurrently.
+const runScanExclusive = createExclusiveRunner();
 
 // ─── Crash Resilience: catch everything ───
 process.on('unhandledRejection', (reason, promise) => {
@@ -176,32 +181,38 @@ app.post('/api/analyze/:symbol', async (req, res) => {
 // ─── Analyze all watchlist symbols ───
 app.post('/api/analyze-all', async (req, res) => {
   try {
-    const symbols = getWatchlist();
-    const results = [];
-
-    for (const symbol of symbols) {
-      try {
-        const quote = await getQuote(symbol);
-        const historical = await getTrainingData(symbol);
-        if (!quote || !historical) {
-          results.push({ symbol, action: 'skip', reason: 'No data' });
-          continue;
-        }
-        const decision = await analyzeSymbol(symbol, quote.price, historical);
-        const result = await executeTrade(symbol, decision.action, quote.price, decision.confidence, decision.reasoning, decision.tradePlan);
-        results.push({ symbol, price: quote.price, ...decision, result });
-        await new Promise(r => setTimeout(r, 500)); // 500ms delay for 20 tickers
-      } catch (e) {
-        results.push({ symbol, error: e.message });
-      }
-    }
-
-    evaluateDay();
-    res.json({ results });
+    const run = await runScanExclusive(() => analyzeAll());
+    if (run.skipped) return res.status(409).json({ error: 'A scan is already running' });
+    res.json({ results: run.value });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
+
+async function analyzeAll() {
+  const symbols = getWatchlist();
+  const results = [];
+
+  for (const symbol of symbols) {
+    try {
+      const quote = await getQuote(symbol);
+      const historical = await getTrainingData(symbol);
+      if (!quote || !historical) {
+        results.push({ symbol, action: 'skip', reason: 'No data' });
+        continue;
+      }
+      const decision = await analyzeSymbol(symbol, quote.price, historical);
+      const result = await executeTrade(symbol, decision.action, quote.price, decision.confidence, decision.reasoning, decision.tradePlan);
+      results.push({ symbol, price: quote.price, ...decision, result });
+      await new Promise(r => setTimeout(r, 500)); // 500ms delay for 20 tickers
+    } catch (e) {
+      results.push({ symbol, error: e.message });
+    }
+  }
+
+  evaluateDay();
+  return results;
+}
 
 // ─── Top 5 Candidates for AI Analysis ──────────────────────────────────────
 // Fast pre-screen all tickers, return top 5 most promising for LLM decision.
@@ -294,19 +305,21 @@ app.get('/api/market/top-history', async (req, res) => {
 app.post('/api/execute', async (req, res) => {
   try {
     const { symbol, action, price, shares, plan, confidence, reasoning } = req.body;
+    // Idempotency key: body.request_id or the Idempotency-Key header. Retries
+    // with the same key never create a second trade.
+    const requestId = req.body.request_id || req.get('Idempotency-Key') || undefined;
     
     if (!symbol || !action || !price || !shares) {
       return res.status(400).json({ error: 'Missing required fields: symbol, action, price, shares' });
     }
 
-    // Execute the AI-approved trade directly (no re-analysis)
-    const result = await executeAIDecision(symbol, action, price, shares, plan);
-
-    // Log the AI decision
-    const db = getDb();
-    db.prepare(
-      'INSERT INTO decisions (symbol, action, price, confidence, reasoning) VALUES (?, ?, ?, ?, ?)'
-    ).run(symbol, action, price, confidence || 0.5, reasoning || `AI pipeline decision: ${action}`);
+    // Execute the AI-approved trade directly (no re-analysis). The decision
+    // row is written once, inside executeTrade.
+    const result = await executeAIDecision(symbol, action, price, shares, plan, {
+      requestId,
+      confidence,
+      reasoning: reasoning || `AI pipeline decision: ${action}`,
+    });
 
     evaluateDay();
 
@@ -367,6 +380,11 @@ app.get('*', (req, res, next) => {
 // Scans all tickers every 2 minutes, 24/7. No market hours check.
 // Buys/sells automatically based on technical analysis.
 async function autoScan() {
+  const run = await runScanExclusive(scanOnce);
+  if (run.skipped) console.log('[auto-scan] previous scan still running, skipping this tick');
+}
+
+async function scanOnce() {
   try {
     const db = getDb();
     const metrics = db.prepare('SELECT trading_paused, cash FROM metrics WHERE id = 1').get();
@@ -406,13 +424,13 @@ async function autoScan() {
   }
 }
 
-// Start auto-scan loop: every 2 minutes
-setInterval(autoScan, 300000);  // 5 minutes
+// Start auto-scan loop: every 5 minutes
+setInterval(autoScan, 300000);
 setTimeout(autoScan, 5000);
 
 app.listen(PORT, HOST, () => {
   console.log(`[trading-bot] running on http://${HOST}:${PORT}`);
-  console.log(`[trading-bot] auto-scan every 2 minutes, 24/7`);
+  console.log(`[trading-bot] auto-scan every 5 minutes, 24/7`);
 });
 
 // ─── Auto-Fix / Health ──────────────────────────────────────────────────────
@@ -625,7 +643,7 @@ app.get('/api/review', (req, res) => {
 // ─── Daily Review Cron (24h loop) ───────────────────────────────────────────
 setInterval(async () => {
   try {
-    const httpRes = await fetch('http://127.0.0.1:5900/api/review');
+    const httpRes = await fetch(`http://127.0.0.1:${PORT}/api/review`);
     const data = await httpRes.json();
     console.log('[review] Daily review complete —', data.totalTrades, 'trades,', (data.winRate*100).toFixed(0) + '% win rate');
     if (data.adjustments.length > 0) {
@@ -636,8 +654,9 @@ setInterval(async () => {
   }
   // Also run regime classifier
   try {
-    const { execSync } = await import('child_process');
-    execSync('python3 /home/openclaw/scripts/regime-classifier.py', { timeout: 120000 });
+    const { execFileSync } = await import('child_process');
+    const script = fileURLToPath(new URL('../training/regime-classifier.py', import.meta.url));
+    execFileSync(process.env.PYTHON || 'python3', [script], { timeout: 120000 });
     console.log('[review] Regime classifier complete');
   } catch (e) {
     console.error('[review] Regime classifier error:', e.message);

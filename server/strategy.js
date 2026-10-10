@@ -2,11 +2,20 @@ import { getDb } from './db.js';
 
 // ─── Risk Parameters ────────────────────────────────────────────────────────
 // Read from DB daily review updates. Falls back to defaults if not set.
-const ACCOUNT_SIZE = 10000;        // RM 10,000 initial balance
+// Reads a fraction in (0, 1] from the environment, e.g. MAX_POSITION_PCT=0.2.
+function envFraction(name, fallback) {
+  const v = parseFloat(process.env[name]);
+  return Number.isFinite(v) && v > 0 && v <= 1 ? v : fallback;
+}
+
+const ACCOUNT_SIZE = 10000;        // RM 10,000 initial balance (fallback if metrics lacks it)
 const MAX_OPEN_TRADES = 8;           // max 8 positions (need room for crypto)
-const MAX_PER_POSITION_PCT = 0.25;   // max 25% of portfolio in any single ticker
-const MAX_DAILY_LOSS = 0.05;         // 5% of account
-const MAX_WEEKLY_LOSS = 0.10;        // 10% of account (soft guard)
+// Max share of account value in any single position. Applied in position sizing
+// and again at execution. Override with MAX_POSITION_PCT.
+export const MAX_POSITION_PCT = envFraction('MAX_POSITION_PCT', 0.25);
+const MAX_CRYPTO_PCT = 0.20;         // max 20% of initial balance in crypto
+export const MAX_DAILY_LOSS = 0.05;  // 5% of account
+export const MAX_WEEKLY_LOSS = 0.10; // 10% of account
 
 // Dynamic params (overridden by daily self-review via DB)
 let DYNAMIC = {
@@ -113,28 +122,31 @@ function calcATR(highs, lows, closes) {
 
 // ─── Risk Checks ────────────────────────────────────────────────────────────
 
+// Realized loss as a fraction of the account base. Only a negative realized
+// P&L counts as a loss; money spent on buys is not a loss.
+export function lossLimitStatus(realizedPnL, accountBase, limitPct) {
+  const loss = Math.max(0, -(realizedPnL || 0));
+  const lossPct = accountBase > 0 ? loss / accountBase : 0;
+  return { loss, lossPct, breached: loss > 0 && lossPct >= limitPct };
+}
+
 export function canTradeToday(db, metrics) {
   // Emergency stop: global kill switch
   if (metrics.trading_paused) {
     return { allowed: false, reason: 'Trading paused via /api/stop. POST /api/resume to restart.' };
   }
 
-  // Daily loss: based on actual closed P&L from sells, not open positions
+  const accountBase = metrics.initial_balance || ACCOUNT_SIZE;
+
+  // Daily loss: realized P&L of today's sells only (created_at is UTC)
   const today = new Date().toISOString().split('T')[0];
-  const todayPnLRow = db.prepare(
+  const todayPnL = db.prepare(
     "SELECT COALESCE(SUM(pnl), 0) as pnl FROM trades WHERE type = 'sell' AND date(created_at) = ?"
-  ).get(today);
-  
-  const todayPnL = todayPnLRow?.pnl || 0;
-  const todayLossPercent = Math.abs(Math.min(todayPnL, 0)) / ACCOUNT_SIZE;
-  
-  // Sanity guard: if loss > 100% of account, data is corrupted. Don't block trades.
-  if (todayLossPercent > 1.0) {
-    return { allowed: true };
-  }
-  
-  if (todayPnL < 0 && todayLossPercent >= MAX_DAILY_LOSS) {
-    return { allowed: false, reason: `Daily loss limit hit: ${(todayLossPercent * 100).toFixed(2)}%` };
+  ).get(today)?.pnl || 0;
+
+  const daily = lossLimitStatus(todayPnL, accountBase, MAX_DAILY_LOSS);
+  if (daily.breached) {
+    return { allowed: false, reason: `Daily loss limit hit: ${(daily.lossPct * 100).toFixed(2)}%` };
   }
 
   // Weekly loss: based on actual closed P&L from sells
@@ -145,11 +157,9 @@ export function canTradeToday(db, metrics) {
     "SELECT COALESCE(SUM(pnl), 0) as pnl FROM trades WHERE type = 'sell' AND date(created_at) >= ?"
   ).get(weekStartStr);
   
-  const weekPnL = weekPnLRow?.pnl || 0;
-  const weekLossPercent = Math.abs(Math.min(weekPnL, 0)) / ACCOUNT_SIZE;
-  
-  if (weekPnL < 0 && weekLossPercent >= MAX_WEEKLY_LOSS) {
-    return { allowed: false, reason: `Weekly loss limit hit: ${(weekLossPercent * 100).toFixed(2)}%` };
+  const weekly = lossLimitStatus(weekPnLRow?.pnl || 0, accountBase, MAX_WEEKLY_LOSS);
+  if (weekly.breached) {
+    return { allowed: false, reason: `Weekly loss limit hit: ${(weekly.lossPct * 100).toFixed(2)}%` };
   }
 
   // Max daily trades: limit number of buys per day
@@ -165,34 +175,52 @@ export function canTradeToday(db, metrics) {
   return { allowed: true };
 }
 
-function calculatePositionSize(entryPrice, stopLoss, accountValue) {
+// Assets priced above 50 are sized in fractional units (3 dp), cheaper ones in
+// whole shares. Always rounds down so caps are never exceeded.
+function roundShares(shares, price) {
+  if (!(shares > 0)) return 0;
+  return price > 50 ? Math.floor(shares * 1000) / 1000 : Math.floor(shares);
+}
+
+// Largest size that keeps one position within maxPositionPct of account value.
+export function maxSharesForPosition(price, accountValue, maxPositionPct = MAX_POSITION_PCT) {
+  if (!(price > 0) || !(accountValue > 0)) return 0;
+  return roundShares((accountValue * maxPositionPct) / price, price);
+}
+
+// Size = min(risk-based size, concentration cap, what cash can pay for).
+// Risk-based size: shares such that hitting the stop loses maxRiskPercent of
+// account value.
+export function calculatePositionSize(entryPrice, stopLoss, accountValue, {
+  cash = accountValue,
+  maxPositionPct = MAX_POSITION_PCT,
+  maxRiskPercent = DYNAMIC.maxRiskPercent,
+} = {}) {
   const riskPerShare = Math.abs(entryPrice - stopLoss);
-  
-  const maxRisk = accountValue * DYNAMIC.maxRiskPercent / 100;
-  
-  // For cheap assets (< RM50), use integer shares
-  // For expensive assets (crypto, high-value stocks), use fractional shares
-  const isFractional = entryPrice > 50;
-  const rawShares = riskPerShare > 0 ? maxRisk / riskPerShare : 0;
-  const shares = isFractional ? Math.round(rawShares * 1000) / 1000 : Math.floor(rawShares);
-  
-  // Minimum position: at least RM10 worth
-  const minValue = 10;
-  const minShares = Math.max(shares, isFractional ? minValue / entryPrice : 1);
-  const finalShares = Math.min(minShares, isFractional ? accountValue / entryPrice * 0.95 : minShares);
-  
-  const actualRisk = finalShares * riskPerShare;
-  
+  const maxRisk = accountValue * maxRiskPercent / 100;
+
+  const riskShares = riskPerShare > 0 ? maxRisk / riskPerShare : 0;
+  const capShares = maxSharesForPosition(entryPrice, accountValue, maxPositionPct);
+  const cashShares = entryPrice > 0 ? cash / entryPrice : 0;
+  const shares = roundShares(Math.min(riskShares, capShares, cashShares), entryPrice);
+
   return {
-    shares: finalShares > 0 ? finalShares : (isFractional ? accountValue / entryPrice * 0.5 : 1),
-    risk: Math.round(Math.min(actualRisk, maxRisk) * 100) / 100,
+    shares,
+    risk: Math.round(shares * riskPerShare * 100) / 100,
     maxRisk: Math.round(maxRisk * 100) / 100,
+    cappedByConcentration: capShares < riskShares,
   };
+}
+
+// Cash plus open positions at cost.
+function getAccountValue(db, metrics) {
+  const holdingsCost = db.prepare('SELECT COALESCE(SUM(shares * avg_cost), 0) as v FROM portfolio WHERE shares > 0').get().v;
+  return metrics.cash + holdingsCost;
 }
 
 // ─── Pre-Trade Checklist ────────────────────────────────────────────────────
 
-function evaluateSetups(symbol, currentPrice, historical, portfolio, metrics) {
+function evaluateSetups(symbol, currentPrice, historical, portfolio, metrics, accountValue = metrics.cash) {
   if (!historical || historical.length < 20) {
     return { trade: false, reason: 'Insufficient data for analysis' };
   }
@@ -266,7 +294,7 @@ function evaluateSetups(symbol, currentPrice, historical, portfolio, metrics) {
     const rr = ((takeProfit - current) / (current - stopLoss));
     
     if (rr >= volMinRR) {
-      const posSize = calculatePositionSize(current, stopLoss, metrics.cash);
+      const posSize = calculatePositionSize(current, stopLoss, accountValue, { cash: metrics.cash });
       buySetup = {
         direction: 'long',
         entry: current,
@@ -290,7 +318,7 @@ function evaluateSetups(symbol, currentPrice, historical, portfolio, metrics) {
     const rr = ((takeProfit - current) / (current - stopLoss));
     
     if (rr >= DYNAMIC.minRewardRisk) {
-      const posSize = calculatePositionSize(current, stopLoss, metrics.cash);
+      const posSize = calculatePositionSize(current, stopLoss, accountValue, { cash: metrics.cash });
       buySetup = {
         direction: 'long',
         entry: current,
@@ -377,9 +405,19 @@ function evaluateSetups(symbol, currentPrice, historical, portfolio, metrics) {
 // This function trusts the AI's decision and only applies basic guardrails
 // (cash balance, daily/weekly loss limits) before executing.
 
-export async function executeAIDecision(symbol, action, price, shares, plan) {
+// requestId (optional) is an idempotency key from the caller. A retried or
+// replayed request with the same key returns the original trade instead of
+// executing a second time.
+export async function executeAIDecision(symbol, action, price, shares, plan, { requestId, confidence, reasoning } = {}) {
   const db = getDb();
   const metrics = db.prepare('SELECT * FROM metrics WHERE id = 1').get();
+
+  if (requestId) {
+    const prior = db.prepare('SELECT id FROM trades WHERE request_id = ?').get(requestId);
+    if (prior) {
+      return { executed: false, duplicate: true, tradeId: prior.id, reason: `Request ${requestId} already executed as trade #${prior.id}` };
+    }
+  }
 
   // Basic guardrails only
   const tradeCheck = canTradeToday(db, metrics);
@@ -396,12 +434,13 @@ export async function executeAIDecision(symbol, action, price, shares, plan) {
     positionSize: shares,
     maxLoss: plan?.maxLoss || (shares * Math.abs(price - (plan?.stopLoss || 0))),
     rewardRisk: plan?.rewardRisk || null,
-    reason: plan?.reason || `AI decision: ${action}`,
+    reason: plan?.reason || reasoning || `AI decision: ${action}`,
     invalidation: plan?.invalidation || null,
-    confidence: plan?.confidence || 0.5,
+    confidence: plan?.confidence || confidence || 0.5,
   };
 
-  return await executeTrade(symbol, action, price, tradePlan.confidence, tradePlan.reason, tradePlan);
+  // executeTrade logs the decision row; callers must not log it again.
+  return await executeTrade(symbol, action, price, tradePlan.confidence, tradePlan.reason, tradePlan, { requestId });
 }
 
 export async function analyzeSymbol(symbol, currentPrice, historical) {
@@ -424,19 +463,25 @@ export async function analyzeSymbol(symbol, currentPrice, historical) {
   const p = getTickerParams(symbol);
   
   // Override global DYNAMIC with per-ticker thresholds for this analysis
-  // (evaluateSetups uses DYNAMIC internally, so we set them before calling it)
+  // (evaluateSetups uses DYNAMIC internally, so we set them before calling it).
+  // Restored afterwards so one ticker's params never leak into the next.
   const _saved = { ...DYNAMIC };
-  DYNAMIC.rsiOversold = p.rsiOversold;
-  DYNAMIC.rsiOverbought = p.rsiOverbought;
-  DYNAMIC.stopMultiplier = p.stopMultiplier;
-  DYNAMIC.minRewardRisk = p.minRewardRisk;
-  DYNAMIC.maxRiskPercent = p.maxRiskPercent;
+  for (const k of ['rsiOversold', 'rsiOverbought', 'stopMultiplier', 'minRewardRisk', 'maxRiskPercent']) {
+    if (p[k] !== undefined) DYNAMIC[k] = p[k];
+  }
+  try {
+    return decide(db, symbol, currentPrice, historical, portfolio, metrics);
+  } finally {
+    DYNAMIC = _saved;
+  }
+}
 
+function decide(db, symbol, currentPrice, historical, portfolio, metrics) {
   // Check if we can trade
   const tradeCheck = canTradeToday(db, metrics);
   
   // Evaluate setups
-  const evaluation = evaluateSetups(symbol, currentPrice, historical, portfolio, metrics);
+  const evaluation = evaluateSetups(symbol, currentPrice, historical, portfolio, metrics, getAccountValue(db, metrics));
 
   // If trade not allowed, report why
   if (!tradeCheck.allowed) {
@@ -499,116 +544,124 @@ export async function analyzeSymbol(symbol, currentPrice, historical) {
     tradePlan: plan,
     assessment: evaluation.assessment,
   };
-  
-  // Restore global params (restore _saved if it was set)
-  if (typeof _saved !== 'undefined') {
-    DYNAMIC = _saved;
-  }
 }
 
 // ─── Execution ──────────────────────────────────────────────────────────────
 
-export async function executeTrade(symbol, action, price, confidence, reasoning, tradePlan) {
+// opts.slippagePct: fixed slippage fraction (default: random 0.1-0.3%).
+// opts.requestId: idempotency key stored on the trade row (unique).
+export async function executeTrade(symbol, action, price, confidence, reasoning, tradePlan, opts = {}) {
   const db = getDb();
   const metrics = db.prepare('SELECT * FROM metrics WHERE id = 1').get();
-  const portfolio = db.prepare('SELECT * FROM portfolio WHERE symbol = ?').get(symbol);
-  const currentShares = portfolio ? portfolio.shares : 0;
   const isCrypto = symbol.endsWith('-USD') || symbol.endsWith('-USDT');
+  const requestId = opts.requestId || null;
 
   // Slippage model: apply 0.1-0.3% slippage to simulate real fills
-  const slippagePct = 0.001 + Math.random() * 0.002; // 0.1-0.3%
+  const slippagePct = opts.slippagePct ?? (0.001 + Math.random() * 0.002); // 0.1-0.3%
   const slippageDir = action === 'buy' ? 1 : -1; // buy higher, sell lower
   const execPrice = Math.round(price * (1 + slippageDir * slippagePct) * 100) / 100;
+  const slippageLogged = Math.round(slippagePct * 10000) / 100;
 
   // Emergency stop: skip execution if paused
   if (metrics.trading_paused) {
     return { executed: false, reason: 'Trading paused via /api/stop' };
   }
 
-  // Log decision
+  // Log decision (exactly once per call)
   db.prepare(
     'INSERT INTO decisions (symbol, action, price, confidence, reasoning) VALUES (?, ?, ?, ?, ?)'
   ).run(symbol, action, price, confidence, reasoning);
 
-  // Execute buy
+  // Execute buy. Checks and writes run in one IMMEDIATE transaction so a second
+  // process (or a retried request) cannot pass the same checks before this
+  // write lands.
   if (action === 'buy' && tradePlan && tradePlan.positionSize > 0) {
-    // Guard: no duplicate buys
-    const existingPos = db.prepare('SELECT shares FROM portfolio WHERE symbol = ? AND shares > 0').get(symbol);
-    if (existingPos) {
-      return { executed: false, reason: `Already holding ${existingPos.shares} shares of ${symbol}. No duplicate buys.` };
-    }
-
-    // Crypto allocation cap: max 20% of total portfolio value in crypto
-    if (isCrypto) {
-      const allHoldings = db.prepare('SELECT * FROM portfolio WHERE shares > 0').all();
-      const cryptoValue = allHoldings
-        .filter(h => h.symbol.endsWith('-USD') || h.symbol.endsWith('-USDT'))
-        .reduce((s, h) => s + h.shares * h.avg_cost, 0);
-      const newTotal = cryptoValue + tradePlan.positionSize * execPrice;
-      const maxCrypto = metrics.initial_balance * 0.20;
-      if (newTotal > maxCrypto) {
-        return { executed: false, reason: `Crypto cap exceeded: RM${newTotal.toFixed(0)} > RM${maxCrypto.toFixed(0)} (20% max)` };
+    const buy = db.transaction(() => {
+      if (requestId && db.prepare('SELECT id FROM trades WHERE request_id = ?').get(requestId)) {
+        return { executed: false, duplicate: true, reason: `Request ${requestId} already executed` };
       }
-    }
 
-    // Single-ticker allocation cap: max 25% of portfolio value per ticker
-    const portfolioCost = db.prepare('SELECT COALESCE(SUM(shares * avg_cost), 0) as v FROM portfolio').get().v;
-    const portfolioValue = metrics.cash + portfolioCost;
-    const maxPositionValue = portfolioValue * MAX_PER_POSITION_PCT;
-    const cappedShares = Math.floor(maxPositionValue / execPrice);
-    if (cappedShares <= 0) {
-      return { executed: false, reason: `Single position cap: RM${maxPositionValue.toFixed(0)} (${(MAX_PER_POSITION_PCT*100).toFixed(0)}% of RM${portfolioValue.toFixed(0)}) too small for 1 share at RM${execPrice}` };
-    }
-    if (tradePlan.positionSize > cappedShares) {
-      tradePlan.positionSize = cappedShares;
-    }
+      // Guard: no duplicate buys
+      const existingPos = db.prepare('SELECT shares FROM portfolio WHERE symbol = ? AND shares > 0').get(symbol);
+      if (existingPos) {
+        return { executed: false, reason: `Already holding ${existingPos.shares} shares of ${symbol}. No duplicate buys.` };
+      }
 
-    const total = tradePlan.positionSize * execPrice;
-    if (metrics.cash < total) {
-      return { executed: false, reason: 'Insufficient cash' };
-    }
+      const m = db.prepare('SELECT * FROM metrics WHERE id = 1').get();
 
-    // Check max open positions
-    const openPositions = db.prepare('SELECT COUNT(*) as c FROM portfolio WHERE shares > 0').get().c;
-    if (openPositions >= MAX_OPEN_TRADES) {
-      return { executed: false, reason: `Max ${MAX_OPEN_TRADES} open positions reached` };
-    }
+      // Crypto allocation cap: max 20% of initial balance in crypto
+      if (isCrypto) {
+        const cryptoValue = db.prepare('SELECT * FROM portfolio WHERE shares > 0').all()
+          .filter(h => h.symbol.endsWith('-USD') || h.symbol.endsWith('-USDT'))
+          .reduce((s, h) => s + h.shares * h.avg_cost, 0);
+        const newTotal = cryptoValue + tradePlan.positionSize * execPrice;
+        const maxCrypto = m.initial_balance * MAX_CRYPTO_PCT;
+        if (newTotal > maxCrypto) {
+          return { executed: false, reason: `Crypto cap exceeded: RM${newTotal.toFixed(0)} > RM${maxCrypto.toFixed(0)} (${MAX_CRYPTO_PCT * 100}% max)` };
+        }
+      }
 
-    db.prepare(
-      'INSERT INTO portfolio (symbol, shares, avg_cost) VALUES (?, ?, ?) ON CONFLICT(symbol) DO UPDATE SET shares = shares + ?, avg_cost = ?'
-    ).run(symbol, tradePlan.positionSize, execPrice, tradePlan.positionSize, execPrice);
+      // Concentration cap: no single position above MAX_POSITION_PCT of account value
+      const accountValue = getAccountValue(db, m);
+      const cappedShares = maxSharesForPosition(execPrice, accountValue);
+      if (cappedShares <= 0) {
+        return { executed: false, reason: `Position cap: RM${(accountValue * MAX_POSITION_PCT).toFixed(0)} (${(MAX_POSITION_PCT * 100).toFixed(0)}% of RM${accountValue.toFixed(0)}) too small for one unit at RM${execPrice}` };
+      }
+      const shares = Math.min(tradePlan.positionSize, cappedShares);
 
-    db.prepare('UPDATE metrics SET cash = cash - ? WHERE id = 1').run(total);
+      const total = shares * execPrice;
+      if (m.cash < total) {
+        return { executed: false, reason: 'Insufficient cash' };
+      }
 
-    db.prepare(
-      'INSERT INTO trades (symbol, type, shares, price, total, reason, confidence, slippage) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-    ).run(symbol, 'buy', tradePlan.positionSize, price, total, reasoning, confidence, Math.round(slippagePct * 10000) / 100);
+      // Check max open positions
+      const openPositions = db.prepare('SELECT COUNT(*) as c FROM portfolio WHERE shares > 0').get().c;
+      if (openPositions >= MAX_OPEN_TRADES) {
+        return { executed: false, reason: `Max ${MAX_OPEN_TRADES} open positions reached` };
+      }
 
-    return {
-      executed: true, action: 'buy',
-      shares: tradePlan.positionSize, price: execPrice, originalPrice: price,
-      total, slippage: Math.round(slippagePct * 10000) / 100,
-      stopLoss: tradePlan.stopLoss, takeProfit: tradePlan.takeProfit,
-    };
+      db.prepare(
+        'INSERT INTO portfolio (symbol, shares, avg_cost) VALUES (?, ?, ?) ON CONFLICT(symbol) DO UPDATE SET shares = shares + ?, avg_cost = ?'
+      ).run(symbol, shares, execPrice, shares, execPrice);
+
+      db.prepare('UPDATE metrics SET cash = cash - ? WHERE id = 1').run(total);
+
+      const info = db.prepare(
+        'INSERT INTO trades (symbol, type, shares, price, total, reason, confidence, slippage, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(symbol, 'buy', shares, price, total, reasoning, confidence, slippageLogged, requestId);
+
+      return {
+        executed: true, action: 'buy', tradeId: Number(info.lastInsertRowid),
+        shares, price: execPrice, originalPrice: price,
+        total, slippage: slippageLogged,
+        cappedByConcentration: shares < tradePlan.positionSize,
+        stopLoss: tradePlan.stopLoss, takeProfit: tradePlan.takeProfit,
+      };
+    });
+    return buy.immediate();
   }
 
-  // Execute sell (close position)
-  if (action === 'sell' && currentShares > 0) {
-    const total = currentShares * execPrice;
-    
-    db.prepare('DELETE FROM portfolio WHERE symbol = ?').run(symbol);
-    db.prepare('UPDATE metrics SET cash = cash + ? WHERE id = 1').run(total);
+  // Execute sell (close position). Position is re-read inside the transaction
+  // so two concurrent sells cannot both close it.
+  if (action === 'sell') {
+    const sell = db.transaction(() => {
+      const portfolio = db.prepare('SELECT * FROM portfolio WHERE symbol = ? AND shares > 0').get(symbol);
+      if (!portfolio) return { executed: false, reason: 'No position' };
+      const currentShares = portfolio.shares;
+      const total = currentShares * execPrice;
+      // Realized P&L of this position only: exit value minus its cost basis.
+      const pnl = total - currentShares * portfolio.avg_cost;
 
-    const buyTrades = db.prepare(
-      "SELECT SUM(total) as cost FROM trades WHERE symbol = ? AND type = 'buy'"
-    ).get(symbol);
-    const pnl = total - (buyTrades?.cost || 0);
+      db.prepare('DELETE FROM portfolio WHERE symbol = ?').run(symbol);
+      db.prepare('UPDATE metrics SET cash = cash + ? WHERE id = 1').run(total);
 
-    db.prepare(
-      'INSERT INTO trades (symbol, type, shares, price, total, pnl, reason, confidence, slippage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    ).run(symbol, 'sell', currentShares, price, total, pnl, reasoning, confidence, Math.round(slippagePct * 10000) / 100);
+      const info = db.prepare(
+        'INSERT INTO trades (symbol, type, shares, price, total, pnl, reason, confidence, slippage, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(symbol, 'sell', currentShares, price, total, pnl, reasoning, confidence, slippageLogged, requestId);
 
-    return { executed: true, action: 'sell', shares: currentShares, price: execPrice, originalPrice: price, total, pnl, slippage: Math.round(slippagePct * 10000) / 100 };
+      return { executed: true, action: 'sell', tradeId: Number(info.lastInsertRowid), shares: currentShares, price: execPrice, originalPrice: price, total, pnl, slippage: slippageLogged };
+    });
+    return sell.immediate();
   }
 
   return { executed: false, reason: action === 'sell' ? 'No position' : 'No valid setup' };

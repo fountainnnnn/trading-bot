@@ -8,8 +8,9 @@
     "build": "vite build",
     "server": "node server/index.js",
     "start": "npm run build && node server/index.js",
-    "test": "node --test test/*.test.js",
-    "test:js": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js && python3 -m unittest discover -s training/tests",
+    "test:js": "node --test test/*.test.js",
+    "test:py": "python3 -m unittest discover -s training/tests"
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",

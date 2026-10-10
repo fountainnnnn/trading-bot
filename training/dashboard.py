@@ -2,7 +2,7 @@
 """Training Dashboard -- Profit over generations only."""
 import json, os, http.server
 
-BASE = '/home/openclaw/projects/trading-bot/training'
+BASE = os.path.dirname(os.path.abspath(__file__))
 PORT = 5903
 
 def load_json(path):
@@ -64,8 +64,7 @@ h1{font-size:20px;font-weight:600;letter-spacing:-0.3px;margin-bottom:2px}
 .top{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
 .chart{background:rgba(255,255,255,0.72);border:1px solid rgba(0,0,0,0.06);border-radius:12px;padding:16px;backdrop-filter:blur(8px);margin-bottom:16px}
 .chart .h{font-size:11px;font-weight:600;text-transform:uppercase;color:#8C8C8C;margin-bottom:8px}
-.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#07CA6B;animation:pulse 1.5s infinite;margin-right:6px}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#07CA6B;margin-right:6px}
 </style>
 </head>
 <body>

@@ -3,7 +3,10 @@
 import json, csv, os, time, urllib.request
 from datetime import datetime
 
-DATA_DIR = '/home/openclaw/projects/trading-bot/training/data/hourly2'
+# Defaults to training/data/hourly2; override the data root with TRAINING_DATA_DIR.
+DATA_DIR = os.path.join(
+    os.environ.get('TRAINING_DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')),
+    'hourly2')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 TICKERS = [

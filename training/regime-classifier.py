@@ -2,10 +2,12 @@
 """Regime classifier with performance feedback loop.
 Classifies each ticker's market regime + adjusts thresholds based on P&L per regime."""
 
-import sqlite3, json, urllib.request, statistics, math
+import sqlite3, json, urllib.request, statistics, math, os
 from datetime import datetime, timedelta
 
-DB_PATH = '/home/openclaw/projects/trading-bot/data/trading.db'
+# Same default and override as server/db.js.
+DB_PATH = os.environ.get('TRADING_DB_PATH', os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'trading.db'))
 YAHOO_BASE = 'https://query1.finance.yahoo.com/v8/finance/chart'
 
 # Baseline thresholds per regime (will be adjusted by performance feedback)

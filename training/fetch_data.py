@@ -3,7 +3,9 @@
 import json, csv, os, time, sys
 from datetime import datetime, timedelta
 
-DATA_DIR = '/home/openclaw/projects/trading-bot/training/data'
+# Defaults to training/data next to this script; override with TRAINING_DATA_DIR.
+DATA_DIR = os.environ.get('TRAINING_DATA_DIR',
+                          os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
 os.makedirs(f'{DATA_DIR}/daily', exist_ok=True)
 os.makedirs(f'{DATA_DIR}/hourly', exist_ok=True)
 

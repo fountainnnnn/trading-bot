@@ -7,9 +7,11 @@ Tests against Year 1 data, validates best on Year 2.
 import json, os, sys, random, copy, subprocess, math
 from datetime import datetime
 
-BASE_DIR = '/home/openclaw/projects/trading-bot/training'
-DATA_DIR = f'{BASE_DIR}/data'
-RESULTS_DIR = f'{BASE_DIR}/results'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get('TRAINING_DATA_DIR', os.path.join(BASE_DIR, 'data'))
+RESULTS_DIR = os.environ.get('TRAINING_RESULTS_DIR', os.path.join(BASE_DIR, 'results'))
+# Live bot database (same default and override as server/db.js)
+DB_PATH = os.environ.get('TRADING_DB_PATH', os.path.join(BASE_DIR, '..', 'data', 'trading.db'))
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # Parameter search space
@@ -98,7 +100,7 @@ def score_params(params, mode='train'):
     
     try:
         cmd = [
-            'python3', f'{BASE_DIR}/backtest.py',
+            sys.executable, os.path.join(BASE_DIR, 'backtest.py'),
             '--params', param_str,
             '--data-dir', DATA_DIR,
             '--output', RESULTS_DIR,
@@ -127,6 +129,13 @@ def score_params(params, mode='train'):
         return 0, {}
 
 def run_genetic_search():
+    # Best fitness from the previous run; params are only deployed if beaten.
+    try:
+        with open(os.path.join(RESULTS_DIR, 'leaderboard.json')) as f:
+            lb = json.load(f)
+    except (OSError, ValueError):
+        lb = {}
+
     print('=' * 60)
     print('TRADING BOT GENETIC PARAMETER SEARCH')
     print('=' * 60)
@@ -153,6 +162,7 @@ def run_genetic_search():
     fitness, result = score_params(PARAM_DEFAULTS, 'train')
     r_val, s_val, d_val = result.get("total_return",0), result.get("sharpe",0), result.get("max_drawdown",0)
     print(f'    Fitness: {fitness:.1f} | Return: {r_val:.1f}% | Sharpe: {s_val:.3f} | DD: {d_val:.1f}%')
+    default_fitness = fitness
     entry = {
         'generation': 0,
         'is_default': True,
@@ -173,8 +183,9 @@ def run_genetic_search():
         gen0_scores.append((fitness, child, result))
         r_val, s_val, d_val = result.get("total_return",0), result.get("sharpe",0), result.get("max_drawdown",0)
         print(f'    Child {i+1}: Fitness: {fitness:.1f} | Return: {r_val:.1f}% | Sharpe: {s_val:.3f} | DD: {d_val:.1f}%')
-        best_fitness = fitness
-        best_params = child.copy()
+        if fitness > best_fitness:
+            best_fitness = fitness
+            best_params = child.copy()
     
     # Select elite from Gen 0
     gen0_scores.sort(key=lambda x: x[0], reverse=True)
@@ -260,7 +271,7 @@ def run_genetic_search():
         # Check live bot params: the daily review may have adjusted them
         try:
             import sqlite3 as _sq
-            _conn = _sq.connect('/home/openclaw/projects/trading-bot/data/trading.db')
+            _conn = _sq.connect(DB_PATH)
             _row = _conn.execute('SELECT params FROM metrics WHERE id = 1').fetchone()
             _conn.close()
             if _row and _row[0]:
@@ -285,7 +296,7 @@ def run_genetic_search():
     if best_fitness > lb.get('best_fitness', 0):
         import subprocess as _sp, sqlite3 as _sq
         try:
-            _conn = _sq.connect('/home/openclaw/projects/trading-bot/data/trading.db')
+            _conn = _sq.connect(DB_PATH)
             _existing = _conn.execute('SELECT params FROM metrics WHERE id = 1').fetchone()
             _cur = json.loads(_existing[0]) if _existing and _existing[0] else {}
             _cur.update(best_params)
@@ -307,7 +318,7 @@ def run_genetic_search():
             'best_params': best_params,
             'best_fitness': best_fitness,
             'default_params': PARAM_DEFAULTS,
-            'default_fitness': leaderboard[-1]['fitness'] if leaderboard else 0,
+            'default_fitness': default_fitness,
             'leaderboard': leaderboard,
             'generations': generation_data,
             'ran_at': datetime.utcnow().isoformat(),
@@ -318,23 +329,24 @@ def run_genetic_search():
     print('=' * 60)
     print(f'\nBest params: {json.dumps(best_params, indent=2)}')
     print(f'Best fitness: {best_fitness:.1f}')
-    print(f'Default fitness: {fitness:.1f}')
-    print(f'Improvement: {((best_fitness - fitness) / fitness * 100):.1f}%')
+    print(f'Default fitness: {default_fitness:.1f}')
+    if default_fitness:
+        print(f'Improvement: {((best_fitness - default_fitness) / default_fitness * 100):.1f}%')
     print(f'\nLeaderboard saved to: {RESULTS_DIR}/leaderboard.json')
     
     # Validate best on test data
     print(f'\nValidating best params on Year 2...')
     test_fitness, test_result = score_params(best_params, 'test')
     print(f'Test fitness: {test_fitness:.1f}')
-    print(f'Test return: {test_result.get(chr(116)+chr(111)+chr(116)+chr(97)+chr(108)+chr(95)+chr(114)+chr(101)+chr(116)+chr(117)+chr(114)+chr(110),0):.1f}%')
-    print(f'Test Sharpe: {test_result.get(chr(115)+chr(104)+chr(97)+chr(114)+chr(112)+chr(101),0):.3f}')
-    print(f'Test drawdown: {test_result.get(chr(109)+chr(97)+chr(120)+chr(95)+chr(100)+chr(114)+chr(97)+chr(119)+chr(100)+chr(111)+chr(119)+chr(110),0):.1f}%')
+    print(f"Test return: {test_result.get('total_return', 0):.1f}%")
+    print(f"Test Sharpe: {test_result.get('sharpe', 0):.3f}")
+    print(f"Test drawdown: {test_result.get('max_drawdown', 0):.1f}%")
     
     # Also test default on test data for comparison
     print(f'\nValidating default params on Year 2...')
     def_fitness, def_result = score_params(PARAM_DEFAULTS, 'test')
     print(f'Default test fitness: {def_fitness:.1f}')
-    print(f'Default test return: {def_result.get(chr(116)+chr(111)+chr(116)+chr(97)+chr(108)+chr(95)+chr(114)+chr(101)+chr(116)+chr(117)+chr(114)+chr(110),0):.1f}%')
+    print(f"Default test return: {def_result.get('total_return', 0):.1f}%")
     
     # Save validation
     validation = {

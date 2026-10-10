@@ -1,13 +1,15 @@
 node_modules/
 dist/
-data/*.db
-data/*.db-*
-data/*.sqlite*
-training/data/
-training/results/
 __pycache__/
 *.py[cod]
 .env
 .env.*
 *.log
 .tmp/
+
+# Generated runtime data (SQLite DB, logs). Created on first run.
+data/
+
+# Generated training data and results
+training/data/
+training/results/

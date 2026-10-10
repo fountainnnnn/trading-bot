@@ -1,14 +1,17 @@
 import Database from 'better-sqlite3';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { mkdirSync } from 'fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = join(__dirname, '..', 'data', 'trading.db');
+// Override with TRADING_DB_PATH (use ':memory:' in tests).
+const DB_PATH = process.env.TRADING_DB_PATH || join(__dirname, '..', 'data', 'trading.db');
 
 let db;
 
 export function initDb() {
   if (db) return db;
+  if (DB_PATH !== ':memory:') mkdirSync(dirname(DB_PATH), { recursive: true });
   db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
